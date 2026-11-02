@@ -1,0 +1,236 @@
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index aaae9a2..d02ce1e 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -2290,6 +2290,21 @@ static const char *get_board_serial( char *str, size_t size, const GUID *uuid )
+     return str;
+ }
+ 
++static const char *get_smbios_sku( char *str, size_t size )
++{
++    unsigned int i, run;
++    get_smbios_string( "/sys/class/dmi/id/product_sku", str, size );
++    /* neutralise ascending/repeated runs (>=4) that trip VM-detection sequence heuristics */
++    for (i = 0; str[i]; i++)
++    {
++        for (run = 1; str[i+run] && str[i+run] == str[i]; run++) {}
++        if (run >= 4) { strcpy( str, "1Z4Q7" ); break; }
++        for (run = 1; str[i+run] && str[i+run] == (char)(str[i+run-1] + 1); run++) {}
++        if (run >= 4) { strcpy( str, "1Z4Q7" ); break; }
++    }
++    return str;
++}
++
+ static struct smbios_prologue *create_smbios_data(void)
+ {
+     char vendor[128], version[128], date[128], product[128], serial[128];
+@@ -2309,7 +2324,7 @@ static struct smbios_prologue *create_smbios_data(void)
+                           get_smbios_string( "/sys/class/dmi/id/product_name", S(product) ),
+                           get_smbios_string( "/sys/class/dmi/id/product_version", S(version) ),
+                           get_system_serial( S(serial) ),
+-                          get_smbios_string( "/sys/class/dmi/id/product_sku", S(sku) ),
++                          get_smbios_sku( S(sku) ),
+                           get_smbios_string( "/sys/class/dmi/id/product_family", S(family) ),
+                           get_system_uuid( &uuid ));
+ 
+@@ -2502,6 +2517,13 @@ static struct smbios_prologue *create_smbios_data(void)
+ 
+ #endif
+ 
++static const char *acpi_tables_dir(void)
++{
++    static const char cache[] = "/var/lib/wine-cloak/acpi";
++    if (access( cache, X_OK ) == 0) return cache;
++    return "/sys/firmware/acpi/tables";
++}
++
+ static NTSTATUS enum_firmware_info( SYSTEM_FIRMWARE_TABLE_INFORMATION *sfti, ULONG available_len,
+                                     ULONG *required_len )
+ {
+@@ -2516,6 +2538,35 @@ static NTSTATUS enum_firmware_info( SYSTEM_FIRMWARE_TABLE_INFORMATION *sfti, ULO
+         *(UINT *)sfti->TableBuffer = 0;
+         return STATUS_SUCCESS;
+ 
++    case ACPI:
++    {
++        DIR *d = opendir( acpi_tables_dir() );
++        struct dirent *de;
++        UINT *ids = NULL, count = 0, cap = 0;
++        if (d)
++        {
++            while ((de = readdir( d )))
++            {
++                UINT id; int i; char sig[4] = { ' ', ' ', ' ', ' ' };
++                if (de->d_name[0] == '.') continue;
++                if (!strcmp( de->d_name, "data" ) || !strcmp( de->d_name, "dynamic" )) continue;
++                for (i = 0; i < 4 && de->d_name[i]; i++) sig[i] = de->d_name[i];
++                id = (unsigned char)sig[0] | ((unsigned char)sig[1] << 8) |
++                     ((unsigned char)sig[2] << 16) | ((unsigned char)sig[3] << 24);
++                if (count == cap) { cap = cap ? cap * 2 : 64; ids = realloc( ids, cap * sizeof(UINT) ); }
++                ids[count++] = id;
++            }
++            closedir( d );
++        }
++        len = count * sizeof(UINT);
++        sfti->TableBufferLength = len;
++        *required_len = offsetof( SYSTEM_FIRMWARE_TABLE_INFORMATION, TableBuffer[len] );
++        if (available_len < *required_len) { free( ids ); return STATUS_BUFFER_TOO_SMALL; }
++        if (ids) memcpy( sfti->TableBuffer, ids, len );
++        free( ids );
++        return STATUS_SUCCESS;
++    }
++
+     default:
+         FIXME("info_class SYSTEM_FIRMWARE_TABLE_INFORMATION provider %08x\n", (unsigned int)sfti->ProviderSignature);
+         return STATUS_NOT_IMPLEMENTED;
+@@ -2544,6 +2595,33 @@ static NTSTATUS get_firmware_info( SYSTEM_FIRMWARE_TABLE_INFORMATION *sfti, ULON
+         memcpy( sfti->TableBuffer, smbios_data, len );
+         return STATUS_SUCCESS;
+ 
++    case ACPI:
++    {
++        char path[320], sig[5] = { 0 };
++        FILE *f; long fsize; size_t got;
++        sig[0] = sfti->TableID & 0xff;
++        sig[1] = (sfti->TableID >> 8) & 0xff;
++        sig[2] = (sfti->TableID >> 16) & 0xff;
++        sig[3] = (sfti->TableID >> 24) & 0xff;
++        snprintf( path, sizeof(path), "%s/%s", acpi_tables_dir(), sig );
++        if (!(f = fopen( path, "rb" )))
++        {
++            snprintf( path, sizeof(path), "%s/%s1", acpi_tables_dir(), sig );
++            f = fopen( path, "rb" );
++        }
++        if (!f) return STATUS_OBJECT_NAME_NOT_FOUND;
++        fseek( f, 0, SEEK_END ); fsize = ftell( f ); fseek( f, 0, SEEK_SET );
++        if (fsize <= 0) { fclose( f ); return STATUS_OBJECT_NAME_NOT_FOUND; }
++        len = fsize;
++        sfti->TableBufferLength = len;
++        *required_len = offsetof( SYSTEM_FIRMWARE_TABLE_INFORMATION, TableBuffer[len] );
++        if (available_len < *required_len) { fclose( f ); return STATUS_BUFFER_TOO_SMALL; }
++        got = fread( sfti->TableBuffer, 1, len, f );
++        fclose( f );
++        if (got != len) return STATUS_UNSUCCESSFUL;
++        return STATUS_SUCCESS;
++    }
++
+     default:
+         FIXME("info_class SYSTEM_FIRMWARE_TABLE_INFORMATION provider %08x\n", (unsigned int)sfti->ProviderSignature);
+         return STATUS_NOT_IMPLEMENTED;
+diff --git a/dlls/wbemprox/builtin.c b/dlls/wbemprox/builtin.c
+index 4bd183a..b074d5f 100644
+--- a/dlls/wbemprox/builtin.c
++++ b/dlls/wbemprox/builtin.c
+@@ -2691,15 +2691,15 @@ static enum fill_status fill_diskdrive( struct table *table, const struct expr *
+             if (!resize_table( table, row + 1, sizeof(*rec) )) return FILL_STATUS_FAILED;
+ 
+             rec = (struct record_diskdrive *)(table->data + offset);
+-            rec->caption       = L"Wine Disk Drive";
++            rec->caption       = L"Samsung SSD 990 PRO";
+             swprintf( device_id, ARRAY_SIZE( device_id ), fmtW, index );
+             rec->device_id     = wcsdup( device_id );
+             rec->index         = index++;
+             rec->interfacetype = L"IDE";
+             rec->manufacturer  = L"(Standard disk drives)";
+             rec->mediatype     = (type == DRIVE_FIXED) ? L"Fixed hard disk" : L"Removable media";
+-            rec->model         = L"Wine Disk Drive";
+-            rec->pnpdevice_id  = L"IDE\\Disk\\VEN_WINE";
++            rec->model         = L"Samsung SSD 990 PRO";
++            rec->pnpdevice_id  = L"IDE\\Disk\\VEN_SAMSUNG";
+             rec->serialnumber  = get_diskdrive_serialnumber( root[0] );
+             rec->signature     = 0;
+             get_freespace( root, &size );
+@@ -4973,8 +4973,71 @@ static enum fill_status fill_sounddevice( struct table *table, const struct expr
+ 
+ #define C(c) sizeof(c)/sizeof(c[0]), c
+ #define D(d) sizeof(d)/sizeof(d[0]), 0, (BYTE *)d
++
++/* --- synthetic thermal/fan sensors so the host looks like real hardware --- */
++static const struct column col_thermalzone[] =
++{
++    { L"CriticalTripPoint",  CIM_UINT32 },
++    { L"CurrentTemperature", CIM_UINT32 },
++    { L"InstanceName",       CIM_STRING|COL_FLAG_KEY },
++};
++struct record_thermalzone
++{
++    UINT32       criticaltrippoint;
++    UINT32       currenttemperature;
++    const WCHAR *instancename;
++};
++static const struct record_thermalzone data_thermalzone[] =
++{
++    { 3732, 3132, L"ACPI\\ThermalZone\\TZ00_0" },
++};
++
++static const struct column col_fan[] =
++{
++    { L"ActiveCooling", CIM_BOOLEAN },
++    { L"DesiredSpeed",  CIM_UINT64 },
++    { L"DeviceID",      CIM_STRING|COL_FLAG_KEY },
++    { L"Name",          CIM_STRING },
++    { L"Status",        CIM_STRING },
++};
++struct record_fan
++{
++    int          activecooling;
++    UINT64       desiredspeed;
++    const WCHAR *device_id;
++    const WCHAR *name;
++    const WCHAR *status;
++};
++static const struct record_fan data_fan[] =
++{
++    { -1, 0, L"Fan 0", L"CPU Cooling Fan", L"OK" },
++};
++
++static const struct column col_tempprobe[] =
++{
++    { L"CurrentReading", CIM_SINT32 },
++    { L"Description",    CIM_STRING },
++    { L"DeviceID",       CIM_STRING|COL_FLAG_KEY },
++    { L"Name",           CIM_STRING },
++    { L"Status",         CIM_STRING },
++};
++struct record_tempprobe
++{
++    int          currentreading;
++    const WCHAR *description;
++    const WCHAR *device_id;
++    const WCHAR *name;
++    const WCHAR *status;
++};
++static const struct record_tempprobe data_tempprobe[] =
++{
++    { 3132, L"CPU Thermal Probe", L"Temperature Probe 0", L"CPU Temperature", L"OK" },
++};
++
+ static struct table cimv2_builtin_classes[] =
+ {
++    { L"Win32_Fan", C(col_fan), D(data_fan) },
++    { L"Win32_TemperatureProbe", C(col_tempprobe), D(data_tempprobe) },
+     { L"__ASSOCIATORS", C(col_associator), D(data_associator) },
+     { L"__PARAMETERS", C(col_param), D(data_param) },
+     { L"__QUALIFIERS", C(col_qualifier), D(data_qualifier) },
+@@ -5025,6 +5088,7 @@ static struct table cimv2_builtin_classes[] =
+ static struct table wmi_builtin_classes[] =
+ {
+     { L"MSSMBios_RawSMBiosTables", C(col_rawsmbiostables), 0, 0, NULL, fill_rawbiosdata },
++    { L"MSAcpi_ThermalZoneTemperature", C(col_thermalzone), D(data_thermalzone) },
+ };
+ 
+ static enum fill_status fill_msft_phys_disk( struct table *table, const struct expr *cond )
+@@ -5070,11 +5134,11 @@ static enum fill_status fill_msft_phys_disk( struct table *table, const struct e
+             swprintf( device_id, ARRAY_SIZE( device_id ), L"%d", index );
+             rec->device_id              = wcsdup( device_id );
+             rec->firmware_version       = L"1234";
+-            rec->friendly_name          = L"Wine disk";
++            rec->friendly_name          = L"Samsung SSD 990 PRO";
+             rec->health_status          = 0; /* Healthy */
+             rec->logical_sector_size    = 512;
+             rec->media_type             = 4; /* SSD */
+-            rec->model                  = wcsdup( L"Wine disk" );
++            rec->model                  = wcsdup( L"Samsung SSD 990 PRO" );
+             rec->operational_status     = dup_array( &operational_status_array );
+             rec->physical_location      = L"Integrated : Bus 0 : Device 0 : Function 0 : Adapter 0 : Port 0";
+             rec->physical_sector_size   = 4096;

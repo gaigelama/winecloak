@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# winecloak — make a Wine/Proton runner + prefix present as a clean bare-metal
+# Windows box (defeats Wine/VM/sandbox fingerprinting for lightweight analysis).
+#
+#   patch-runner <dir>            binary-patch an existing runner (no rebuild)
+#   harden <prefix> [--keep-z]    harden a prefix (drives, files, identity)
+#   prelaunch <prefix>            FS-only re-harden (keeps z:) — for a launch hook
+#   stage-acpi [--dir <cache>]    copy host ACPI tables to a readable cache (sudo)
+#   build <wine-src> --out <dir>  apply source patch + compile + patch-runner
+#   probe <prefix> --runner <w>   run the detection probe, report tells
+#   package <dir> --name <N>      wrap a cloaked runner as a Steam/Lutris tool tarball
+#   smbios <prefix>               give a prefix a unique machine UUID + serials (build-mode)
+#   all <dir> <prefix> [--keep-z] patch-runner + harden + stage-acpi
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+LIB="$HERE/lib"; PATCHES="$HERE/patches"; PROBES="$HERE/probes"
+ACPI_CACHE="${WINE_CLOAK_ACPI:-/var/lib/wine-cloak/acpi}"
+PRODID_DEFAULT="00330-80000-00000-AA833"
+
+die(){ echo "winecloak: $*" >&2; exit 1; }
+gen_key(){ printf '%s' "$(tr -dc 'A-Za-z' </dev/urandom|head -c1)$(tr -dc 'A-Za-z0-9' </dev/urandom|head -c3)"; }
+find_wine(){ # locate a wine loader under a runner dir
+  for c in "$1/bin/wine" "$1/files/bin/wine" "$1/wine"; do [ -x "$c" ] && { echo "$c"; return; }; done
+  find "$1" -type f -name wine -path '*bin*' 2>/dev/null | head -1
+}
+
+cmd_patch_runner(){
+  local dir="${1:?usage: patch-runner <runner-dir>}"; [ -d "$dir" ] || die "no such dir: $dir"
+  local key; key="$(gen_key)"
+  echo "[*] runner: $dir   (config key -> Software\\$key)"
+
+  echo "[*] hiding wine_get_* / file-name exports"
+  python3 -I "$LIB/patch_exports.py" "$dir"
+
+  echo "[*] renaming config key in binaries (ASCII + UTF-16)"
+  mapfile -t B < <(find "$dir" -type f \( -name '*.so' -o -name '*.dll' -o -name '*.exe' \))
+  chmod u+w "${B[@]}" 2>/dev/null || true
+  python3 -I "$LIB/patch_regkey.py" --key "$key" "${B[@]}" >/dev/null
+
+  echo "[*] patching wine.inf (identity + config key)"
+  local inf; inf="$(find "$dir" -name wine.inf -path '*share/wine*' | head -1)"
+  if [ -n "$inf" ]; then
+    chmod u+w "$inf"
+    sed -i "s/12345-oem-0000001-54321/$PRODID_DEFAULT/g;
+            s/\"InstallDate\",0x10003,1273299354/\"InstallDate\",0x10003,1700000000/;
+            s/\"RegisteredOwner\",2,\"\"/\"RegisteredOwner\",2,\"Windows User\"/g;
+            s/Software\\\\Wine/Software\\\\$key/g" "$inf"
+  else echo "    (no wine.inf found — skipping identity)"; fi
+
+  echo "$key" > "$dir/.wine-cloak-key" 2>/dev/null || true
+  echo "[done] runner patched. ACPI/HPET + disk/thermal WMI require 'build' mode."
+}
+
+cmd_harden(){
+  local pfx="${1:?usage: harden <prefix> [--keep-z] [--runner <wine>]}"; shift || true
+  local keepz=0 wine=""
+  while [ $# -gt 0 ]; do case "$1" in --keep-z) keepz=1;; --runner) wine="$2"; shift;; esac; shift; done
+  [ -d "$pfx" ] || die "no such prefix: $pfx"
+  [ -n "$wine" ] || wine="$(command -v wine || true)"; [ -x "$wine" ] || die "need --runner <wine-binary>"
+
+  echo "[*] removing cosmetic wine-named executables"
+  for f in winemenubuilder winecfg winefile winemine winhelp; do
+    rm -f "$pfx"/drive_c/windows/system32/$f.exe "$pfx"/drive_c/windows/syswow64/$f.exe 2>/dev/null || true
+  done
+  echo "[*] drive letters (drop /dev$([ $keepz = 0 ] && echo ' and host z:'))"
+  for l in "$pfx"/dosdevices/*; do [ -L "$l" ] || continue
+    case "$(readlink "$l")" in /dev/*) rm -f "$l";; /) [ $keepz = 0 ] && rm -f "$l";; esac
+  done
+  echo "[*] registry: remove Software\\Wine marker, set realistic identity"
+  local CV='HKLM\Software\Microsoft\Windows NT\CurrentVersion'
+  WINEPREFIX="$pfx" WINEDEBUG=-all WINEDLLOVERRIDES="winemenubuilder.exe=;mscoree=;mshtml=" bash -c "
+    '$wine' reg delete 'HKCU\\Software\\Wine' /f  >/dev/null 2>&1 || true
+    '$wine' reg delete 'HKLM\\Software\\Wine' /f  >/dev/null 2>&1 || true
+    '$wine' reg add '$CV' /v ProductId       /t REG_SZ    /d '$PRODID_DEFAULT' /f >/dev/null 2>&1 || true
+    '$wine' reg add '$CV' /v InstallDate      /t REG_DWORD /d 1700000000        /f >/dev/null 2>&1 || true
+    '$wine' reg add '$CV' /v RegisteredOwner  /t REG_SZ    /d 'Windows User'     /f >/dev/null 2>&1 || true
+    '$wine'server -w 2>/dev/null || true"
+  echo "[done] prefix hardened. (Note: only a cloak-patched runner keeps Software\\Wine from returning.)"
+}
+
+cmd_prelaunch(){
+  local pfx="${1:-${WINEPREFIX:-}}"; [ -d "$pfx" ] || exit 0
+  for l in "$pfx"/dosdevices/*; do [ -L "$l" ] || continue; case "$(readlink "$l")" in /dev/*) rm -f "$l";; esac; done
+  for f in winemenubuilder winecfg winefile winemine winhelp; do
+    rm -f "$pfx"/drive_c/windows/system32/$f.exe "$pfx"/drive_c/windows/syswow64/$f.exe 2>/dev/null || true
+  done
+}
+
+cmd_stage_acpi(){
+  local cache="$ACPI_CACHE"; [ "${1:-}" = "--dir" ] && cache="$2"
+  [ -d /sys/firmware/acpi/tables ] || die "no /sys/firmware/acpi/tables on this host"
+  echo "[*] staging host ACPI tables -> $cache  (needs root once)"
+  sudo bash -c "mkdir -p '$cache' && cp /sys/firmware/acpi/tables/* '$cache'/ 2>/dev/null; chmod -R a+rX '$cache'"
+  echo "[done] staged $(ls "$cache" 2>/dev/null | wc -l) tables. Survives reboot; one-time."
+}
+
+cmd_build(){
+  local src="${1:?usage: build <wine-src> --out <dir>}"; shift
+  local out=""; while [ $# -gt 0 ]; do case "$1" in --out) out="$2"; shift;; esac; shift; done
+  [ -n "$out" ] || die "need --out <install-dir>"
+  [ -f "$src/configure" ] || die "$src is not a wine source tree"
+  echo "[*] applying source patches (ACPI/thermal/disk/SKU + per-prefix SMBIOS)"
+  python3 -I "$LIB/patch_source.py" "$src"
+  python3 -I "$LIB/patch_smbios.py" "$src"
+  echo "[*] configure + make (new-wow64 i386,x86_64) — this is the long part"
+  mkdir -p "$src/build"; ( cd "$src/build" && ../configure --enable-archs=i386,x86_64 --prefix="$out" >/dev/null && make -j"$(nproc)" && make install >/dev/null )
+  echo "[*] applying no-rebuild patches to the fresh install"
+  cmd_patch_runner "$out"
+  echo "[done] built + cloaked wine at: $out/bin/wine   (run 'stage-acpi' for HPET)"
+}
+
+cmd_probe(){
+  local pfx="${1:?usage: probe <prefix> --runner <wine>}"; shift
+  local wine=""; while [ $# -gt 0 ]; do case "$1" in --runner) wine="$2"; shift;; esac; shift; done
+  [ -x "$wine" ] || die "need --runner <wine-binary>"
+  mkdir -p "$pfx/drive_c/_cloak"; cp "$PROBES"/winecheck2.exe "$PROBES"/winecheck3.exe "$pfx/drive_c/_cloak/" 2>/dev/null || true
+  for p in winecheck2 winecheck3; do
+    echo "===== $p ====="
+    WINEPREFIX="$pfx" WINEDEBUG=-all WINEDLLOVERRIDES="winemenubuilder.exe=;mscoree=;mshtml=" \
+      "$wine" cmd /c "c:\\_cloak\\$p.exe > c:\\_cloak\\o.txt 2>&1" >/dev/null 2>&1 || true
+    "$wine"server -w 2>/dev/null || true
+    cat "$pfx/drive_c/_cloak/o.txt" 2>/dev/null
+  done
+  rm -rf "$pfx/drive_c/_cloak"
+}
+
+cmd_package(){
+  local dir="${1:?usage: package <runner-dir> --name <Name> [--out <dir>]}"; shift
+  local name="" out="."
+  while [ $# -gt 0 ]; do case "$1" in --name) name="$2"; shift;; --out) out="$2"; shift;; esac; shift; done
+  [ -n "$name" ] || die "need --name <Name> (e.g. GE-Proton-Hidden or Wine-Hidden)"
+  [ -d "$dir" ] || die "no such dir: $dir"
+  local base; base="$(basename "$dir")"; local parent; parent="$(cd "$dir/.." && pwd)"
+
+  if [ -f "$dir/proton" ]; then
+    echo "[*] Proton tool detected — writing Steam manifest for '$name'"
+    local vdf="$dir/compatibilitytool.vdf"
+    if [ -f "$vdf" ]; then
+      sed -i -E "s/\"[A-Za-z0-9._-]*-?[Hh]idden[A-Za-z0-9._-]*\"/\"$name\"/g; s/\"display_name\"[[:space:]]*\"[^\"]*\"/\"display_name\"  \"$name\"/" "$vdf"
+    else
+      cat > "$vdf" <<EOF
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "$name"
+    {
+      "install_path" "."
+      "display_name" "$name"
+      "from_oslist"  "windows"
+      "to_oslist"    "linux"
+    }
+  }
+}
+EOF
+    fi
+    [ -f "$dir/toolmanifest.vdf" ] || die "proton tool missing toolmanifest.vdf"
+    echo "    -> Steam-compatible (compatibilitytools.d) AND Lutris-usable"
+  else
+    [ -n "$(find_wine "$dir")" ] || die "no 'proton' script and no wine binary — not a runner"
+    echo "[*] Wine runner detected — packaging as a Lutris wine runner ('$name')"
+    echo "    note: vanilla Wine has no proton wrapper, so it is NOT a Steam compat tool"
+  fi
+
+  mkdir -p "$out"
+  local tgz="$out/$name.tar.gz"
+  echo "[*] creating $tgz (top-level dir renamed to '$name')…"
+  tar czf "$tgz" -C "$parent" --transform "s,^$base,$name," "$base"
+  echo "[done] $tgz"
+  echo "       Steam : extract into ~/.steam/steam/compatibilitytools.d/   (restart Steam)"
+  echo "       Lutris: extract into ~/.local/share/lutris/runners/wine/  (or the flatpak data dir)"
+  echo "       ProtonUp-Qt: publish as a GitHub release + add a ctmod (see README)"
+}
+
+cmd_smbios(){
+  local pfx="${1:?usage: smbios <prefix>}"; [ -d "$pfx" ] || die "no such prefix: $pfx"
+  local mid sys brd chs
+  rnd(){ head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }   # 2*N hex chars, pipe-safe
+  mid=$(rnd 16)                            # 32 hex -> UUID
+  sys="FTB$(rnd 5 | tr 'a-f' 'A-F')"       # FTB + 10 hex
+  brd="MTABG$(rnd 4 | tr 'a-f' 'A-F')"     # MTABG + 8 hex
+  chs=$(rnd 6 | tr 'a-f' 'A-F')            # 12 hex
+  cat > "$pfx/.wine-cloak-smbios" <<EOF
+machineid=$mid
+system_serial=$sys
+board_serial=$brd
+chassis_serial=$chs
+EOF
+  echo "[smbios] unique per-instance profile written: $pfx/.wine-cloak-smbios"
+  echo "         uuid-seed=$mid  serial=$sys  board=$brd  chassis=$chs"
+  echo "         (requires a build-mode runner; patch-mode runners read host SMBIOS)"
+}
+
+cmd_all(){ local d="${1:?}" p="${2:?}"; shift 2; cmd_patch_runner "$d"; local w; w="$(find_wine "$d")"; cmd_harden "$p" --runner "$w" "$@"; cmd_smbios "$p"; cmd_stage_acpi; }
+
+case "${1:-}" in
+  patch-runner) shift; cmd_patch_runner "$@";;
+  harden)       shift; cmd_harden "$@";;
+  prelaunch)    shift; cmd_prelaunch "$@";;
+  stage-acpi)   shift; cmd_stage_acpi "$@";;
+  build)        shift; cmd_build "$@";;
+  probe)        shift; cmd_probe "$@";;
+  package)      shift; cmd_package "$@";;
+  smbios)       shift; cmd_smbios "$@";;
+  all)          shift; cmd_all "$@";;
+  ""|-h|--help) awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0";;
+  *) die "unknown command: $1 (try --help)";;
+esac
